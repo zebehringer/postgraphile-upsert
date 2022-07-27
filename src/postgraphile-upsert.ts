@@ -10,6 +10,7 @@ export const PgMutationUpsertPlugin: Plugin = (builder) => {
         GraphQLInputObjectType,
         GraphQLNonNull,
         GraphQLString,
+        GraphQLBoolean,
       },
       inflection,
       newWithHooks,
@@ -110,6 +111,21 @@ export const PgMutationUpsertPlugin: Plugin = (builder) => {
               pgInflection: table,
             }
           );
+          const IgnoreType = newWithHooks(
+            GraphQLInputObjectType,
+            {
+              name: `Upsert${tableTypeName}Ignore`,
+              description: `Fields to skip when resolving conflicts upsert \`${tableTypeName}\` mutation.`,
+              fields: attributes.reduce((acc, attr) => {
+                acc[ inflection.camelCase(attr.name) ] = { type: GraphQLBoolean };
+                return acc;
+              }, {}),
+            },
+            {
+              isPgCreateInputType: false,
+              pgInflection: table,
+            }
+          );
 
           // Standard input type that 'create' uses
           const InputType = newWithHooks(
@@ -184,10 +200,13 @@ export const PgMutationUpsertPlugin: Plugin = (builder) => {
                   input: {
                     type: new GraphQLNonNull(InputType),
                   },
+                  ignore: {
+                    type: IgnoreType,
+                  },
                 },
                 async resolve(
                   data,
-                  { where, input },
+                  { where, input, ignore },
                   { pgClient },
                   resolveInfo
                 ) {
@@ -283,6 +302,8 @@ export const PgMutationUpsertPlugin: Plugin = (builder) => {
 
                   const [constraintName] = matchingConstraint;
 
+                  const ignoreUpdate = {};
+
                   // Loop thru columns and "SQLify" them
                   attributes.forEach((attr) => {
                     // where clause should override any "input" for the matching column to be a true upsert
@@ -297,6 +318,15 @@ export const PgMutationUpsertPlugin: Plugin = (builder) => {
                     ) {
                       whereClauseValue = where[inflection.camelCase(attr.name)];
                       hasWhereClauseValue = true;
+                    }
+
+                    ignoreUpdate[attr.name] = omit(attr, "updateOnConflict");
+
+                    if (ignore && Object.prototype.hasOwnProperty.call(
+                      ignore,
+                      inflection.camelCase(attr.name)
+                    )) {
+                      ignoreUpdate[attr.name] = ignore[inflection.camelCase(attr.name)];
                     }
 
                     // Do we have a value for the field in input?
@@ -325,7 +355,7 @@ export const PgMutationUpsertPlugin: Plugin = (builder) => {
                   });
 
                   // Construct a array in case we need to do an update on conflict
-                  const conflictUpdateArray = sqlColumns.map(
+                  const conflictUpdateArray = sqlColumns.filter((col) => ignoreUpdate[col.names[0]] != true).map(
                     (col) =>
                       sql.query`${sql.identifier(
                         col.names[0]
