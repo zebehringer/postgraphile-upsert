@@ -57,7 +57,7 @@
     "test": "c8 -r=lcov -r=text-summary ava --timeout=2m",
     "semantic-release": "semantic-release",
     "lint": "prettier --check . && eslint '**/*.{ts,js}'",
-    "prepare": "husky install"
+    "prepare": "npm run build && husky install"
   },
   "ava": {
     "extensions": [
