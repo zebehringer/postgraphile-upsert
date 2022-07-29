@@ -1,22 +1,136 @@
+import assert from "assert";
 import { Build, Context, Plugin } from "graphile-build";
-import type { Attribute, Constraint, PgTable } from "./types";
-import type {
+import { PgAttribute } from "graphile-build-pg";
+import {
+  makeAddInflectorsPlugin,
+  makePluginByCombiningPlugins,
+} from "graphile-utils";
+import {
   GraphQLFieldConfigMap,
+  GraphQLList,
   GraphQLObjectType,
   GraphQLScalarType,
 } from "graphql";
-import assert from "assert";
+import type { Attribute, Constraint, PgTable } from "./types";
 
 type Primitive = string | number | null;
 
-export const PgMutationUpsertPlugin: Plugin = (builder) => {
+interface DefaultInflectors {
+  constantCase: (table: string) => string;
+  upperCamelCase: (table: string) => string;
+  _tableName: (table: PgTable) => string;
+  _columnName: (attr: PgAttribute) => string;
+}
+
+interface UpsertInflectors extends DefaultInflectors {
+  upsertIgnoreEnum: (table: PgTable) => string;
+  upsertIgnoreColumnEnum: (attr: PgAttribute) => string;
+}
+
+const PgMutationUpsertInflectionPlugin = makeAddInflectorsPlugin({
+  upsertIgnoreEnum(table: PgTable) {
+    const _this = this as unknown as DefaultInflectors;
+    return _this.upperCamelCase(`upsert-${_this._tableName(table)}-ignore`);
+  },
+  upsertIgnoreColumnEnum(attr) {
+    const _this = this as unknown as DefaultInflectors;
+    return _this.constantCase(`${_this._columnName(attr)}`);
+  },
+});
+
+const PgMutationUpsertResolverPlugin: Plugin = (builder) => {
+  builder.hook("build", (_, build) => {
+    const { extend, pgIntrospectionResultsByKind, pgOmit: omit } = build;
+    const upsertableTables = (
+      pgIntrospectionResultsByKind.class as PgTable[]
+    ).filter(
+      (table) =>
+        !!table.namespace &&
+        !!table.primaryKeyConstraint &&
+        !omit(table, "upsert") &&
+        table.isSelectable &&
+        table.isInsertable &&
+        table.isUpdatable
+    );
+
+    return extend(build, {
+      upsertableTables,
+    });
+  });
+
+  builder.hook("init", (_, build) => {
+    const {
+      describePgEntity,
+      graphql: { GraphQLEnumType },
+      inflection,
+      newWithHooks,
+      wrapDescription,
+      upsertableTables,
+    } = build;
+
+    const upsertInflection = inflection as UpsertInflectors;
+    upsertableTables.forEach((table) => {
+      const tableTypeName = inflection.tableType(table);
+      newWithHooks(
+        GraphQLEnumType,
+        {
+          name: upsertInflection.upsertIgnoreEnum(table),
+          description: wrapDescription(
+            `Ignorable fields for \`${tableTypeName}\` that will be excluded from an update operation during an upsert.`
+          ),
+          values: {},
+        },
+        {
+          __origin: `Adding ignorable fields enum tuype for ${describePgEntity(
+            table
+          )}.`,
+          pgIntrospection: table,
+          isPgUpsertIgnoreEnum: true,
+        },
+        true
+      );
+    });
+
+    return _;
+  });
+
+  builder.hook("GraphQLEnumType:values", (values, build, context) => {
+    const { extend, inflection, pgOmit: omit, describePgEntity } = build;
+    const {
+      scope: { isPgUpsertIgnoreEnum, pgIntrospection: table },
+    } = context;
+
+    if (!isPgUpsertIgnoreEnum || !table || table.kind !== "class") {
+      return values;
+    }
+
+    return extend(
+      values,
+      table.attributes.reduce((acc, attr) => {
+        if (omit(attr, "updateOnConflict") || omit(attr, "update")) {
+          return acc;
+        }
+
+        const fieldName = inflection.upsertIgnoreColumnEnum(attr);
+        return extend(
+          acc,
+          {
+            [fieldName]: {},
+          },
+          `Adding ignore enum value for ${describePgEntity(attr)}.`
+        );
+      }, {}),
+      `Adding upsert ignore values for columns from table '${table.name}'`
+    );
+  });
+
   builder.hook("GraphQLObjectType:fields", (fields, build, context) => {
     const {
       extend,
       pgGetGqlInputTypeByTypeIdAndModifier,
       pgGetGqlTypeByTypeIdAndModifier,
       pgIntrospectionResultsByKind,
-      pgOmit: omit,
+      upsertableTables,
     } = build;
     const {
       scope: { isRootMutation },
@@ -25,35 +139,27 @@ export const PgMutationUpsertPlugin: Plugin = (builder) => {
     const allUniqueConstraints = (
       pgIntrospectionResultsByKind.constraint as Constraint[]
     ).filter((con) => con.type === "u" || con.type === "p");
-    const upsertFieldsByName = (pgIntrospectionResultsByKind.class as PgTable[])
-      .filter(
-        (table) =>
-          !!table.namespace &&
-          !!table.primaryKeyConstraint &&
-          !omit(table, "upsert") &&
-          table.isSelectable &&
-          table.isInsertable &&
-          table.isUpdatable
-      )
-      .reduce<GraphQLFieldConfigMap<unknown, unknown>>((fnsByName, table) => {
-        const gqlTable = pgGetGqlTypeByTypeIdAndModifier(table.type.id, null);
-        if (!gqlTable) return fnsByName;
-        const gqlTableInput = pgGetGqlInputTypeByTypeIdAndModifier(
-          table.type.id,
-          null
-        );
-        if (!gqlTableInput) return fnsByName;
-        const { fn, upsertFnName } = createUpsertField({
-          allUniqueConstraints,
-          table,
-          build,
-          context,
-          gqlTable,
-          gqlTableInput,
-        });
-        fnsByName[upsertFnName] = fn;
-        return fnsByName;
-      }, {});
+    const upsertFieldsByName = (upsertableTables as PgTable[]).reduce<
+      GraphQLFieldConfigMap<unknown, unknown>
+    >((fnsByName, table) => {
+      const gqlTable = pgGetGqlTypeByTypeIdAndModifier(table.type.id, null);
+      if (!gqlTable) return fnsByName;
+      const gqlTableInput = pgGetGqlInputTypeByTypeIdAndModifier(
+        table.type.id,
+        null
+      );
+      if (!gqlTableInput) return fnsByName;
+      const { fn, upsertFnName } = createUpsertField({
+        allUniqueConstraints,
+        table,
+        build,
+        context,
+        gqlTable,
+        gqlTableInput,
+      });
+      fnsByName[upsertFnName] = fn;
+      return fnsByName;
+    }, {});
     return extend(fields, upsertFieldsByName);
   });
 };
@@ -83,7 +189,6 @@ function createUpsertField({
       GraphQLInputObjectType,
       GraphQLNonNull,
       GraphQLString,
-      GraphQLBoolean,
     },
     inflection,
     newWithHooks,
@@ -95,6 +200,7 @@ function createUpsertField({
     pgViaTemporaryTable: viaTemporaryTable,
     pgField,
     pgOmit: omit,
+    wrapDescription,
   } = build;
   const { fieldWithHooks } = context;
   const tableTypeName = inflection.tableType(table);
@@ -162,21 +268,7 @@ function createUpsertField({
     }
   );
 
-  const IgnoreType = newWithHooks(
-    GraphQLInputObjectType,
-    {
-      name: `Upsert${tableTypeName}Ignore`,
-      description: `Fields to skip when resolving conflicts upsert \`${tableTypeName}\` mutation.`,
-      fields: attributes.reduce((acc, attr) => {
-        acc[ inflection.camelCase(attr.name) ] = { type: GraphQLBoolean };
-        return acc;
-      }, {}),
-    },
-    {
-      isPgCreateInputType: false,
-      pgInflection: table,
-    }
-  );
+  const IgnoreType = build.getTypeByName(inflection.upsertIgnoreEnum(table));
 
   // Standard input type that 'create' uses
   const InputType = newWithHooks(
@@ -251,7 +343,10 @@ function createUpsertField({
               type: new GraphQLNonNull(InputType),
             },
             ignore: {
-              type: IgnoreType,
+              type: new GraphQLList(new GraphQLNonNull(IgnoreType)),
+              description: wrapDescription(
+                `The properties to ignore when performing an update on \`${tableTypeName}\``
+              ),
             },
           },
           async resolve(
@@ -341,7 +436,11 @@ function createUpsertField({
 
             const [constraintName] = matchingConstraint;
 
-            const ignoreUpdate = {};
+            const ignoreArg = (ignore || []).reduce((acc, field) => {
+              acc.add(field);
+              return acc;
+            }, new Set());
+            const ignoreUpdate = new Set();
 
             // Loop thru columns and "SQLify" them
             attributes.forEach((attr) => {
@@ -356,13 +455,12 @@ function createUpsertField({
                 hasWhereClauseValue = true;
               }
 
-              ignoreUpdate[attr.name] = omit(attr, "updateOnConflict");
-
-              if (ignore && Object.prototype.hasOwnProperty.call(
-                ignore,
-                inflection.camelCase(attr.name)
-              )) {
-                ignoreUpdate[attr.name] = ignore[inflection.camelCase(attr.name)];
+              if (
+                omit(attr, "update") ||
+                omit(attr, "updateOnConflict") ||
+                ignoreArg.has(inflection.upsertIgnoreColumnEnum(attr))
+              ) {
+                ignoreUpdate.add(attr.name);
               }
 
               // Do we have a value for the field in input?
@@ -389,12 +487,14 @@ function createUpsertField({
             });
 
             // Construct a array in case we need to do an update on conflict
-            const conflictUpdateArray = sqlColumns.filter((col) => ignoreUpdate[col.names[0]] != true).map(
-              (col) =>
-                sql.query`${sql.identifier(
-                  col.names[0]
-                )} = excluded.${sql.identifier(col.names[0])}`
-            );
+            const conflictUpdateArray = sqlColumns
+              .filter((col) => !ignoreUpdate.has(col.names[0]))
+              .map(
+                (col) =>
+                  sql.query`${sql.identifier(
+                    col.names[0]
+                  )} = excluded.${sql.identifier(col.names[0])}`
+              );
             assert(table.namespace, "expected table namespace");
 
             // SQL query for upsert mutations
@@ -435,3 +535,8 @@ function createUpsertField({
     ),
   };
 }
+
+export const PgMutationUpsertPlugin = makePluginByCombiningPlugins(
+  PgMutationUpsertInflectionPlugin,
+  PgMutationUpsertResolverPlugin
+);
