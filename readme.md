@@ -51,10 +51,11 @@ create table bikes (
   model varchar
   serial_number varchar unique not null,
   weight real,
+  last_updated timestamptz,
 )
 ```
 
-An upsert would look like this:
+A basic upsert would look like this:
 
 ```graphql
 mutation {
@@ -73,6 +74,61 @@ mutation {
   }
 }
 ```
+
+An upsert that doesn't update anything that already exists would look like this:
+
+```graphql
+mutation {
+  upsertBike(
+    where: { serial_number: "abc123" }
+    input: {
+      bike: {
+        make: "kona"
+        model: "kula deluxe"
+        serial_number: "abc123"
+        weight: 25.6
+      }
+    }
+    onConflict: {
+      doNothing: true
+    }
+  ) {
+    clientMutationId
+  }
+}
+```
+
+An upsert with special conflict resolution would look like this:
+
+```graphql
+mutation {
+  upsertBike(
+    where: { serial_number: "abc123" }
+    input: {
+      bike: {
+        make: "kona"
+        model: "kula deluxe"
+        serial_number: "abc123"
+        weight: 25.6
+      }
+    }
+    onConflict: {
+      doUpdate: {
+        make: ignore
+        lastUpdated: current_timestamp
+      }
+    }
+  ) {
+    clientMutationId
+  }
+}
+```
+
+## Smart Tags
+
+- Add `@omit upsert` to column comments to prevent them from being insertable or updateable in an upsert mutation.
+- Add `@omit updateOnConflict` to column comments to prevent them from being modified on _existing_ rows in an upsert mutation.
+  - `@omit update` is also honored this way, but also prevents those columns from being modified by normal update mutations, so `@omit updateOnConflict` is the alternative if you still want to be able to update those columns in normal update mutations.
 
 ## Credits
 
