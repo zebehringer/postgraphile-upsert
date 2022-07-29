@@ -1,6 +1,6 @@
-import { freeport } from "./freeport";
 import Docker from "dockerode";
 import execa from "execa";
+import { freeport } from "./freeport";
 
 const DB_IMAGE = "postgres:12-alpine";
 

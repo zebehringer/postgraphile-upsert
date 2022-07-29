@@ -1,14 +1,14 @@
-import { container, DbContext } from "./fixture/db";
-import { createPool } from "./fixture/client";
+import ava, { ExecutionContext, TestFn } from "ava";
 import { createServer, Server } from "http";
-import { freeport } from "./fixture/freeport";
-import { PgMutationUpsertPlugin } from "../postgraphile-upsert";
+import fetch from "node-fetch";
 import { Pool } from "pg";
 import { postgraphile } from "postgraphile";
-import ava, { TestFn, ExecutionContext } from "ava";
+import { PgMutationUpsertPlugin } from "../postgraphile-upsert";
+import { createPool } from "./fixture/client";
+import { container, DbContext } from "./fixture/db";
+import { freeport } from "./fixture/freeport";
 import nanographql = require("nanographql");
 import Bluebird = require("bluebird");
-import fetch from "node-fetch";
 
 type TestContext = DbContext & {
   client: Pool;
@@ -47,7 +47,6 @@ test.beforeEach(async (t) => {
       unique (project_name, title)
     )
   `);
-  await t.context.client.query(`COMMENT ON COLUMN roles.rank IS E'@omit updateOnConflict'`);
   await t.context.client.query(`
       create table no_primary_keys(
         name text
@@ -305,7 +304,7 @@ test("upsert where clause", async (t) => {
   }) => {
     const query = nanographql(`
       mutation {
-        upsertRole(ignore: {rank: false}, where: {
+        upsertRole(where: {
           projectName: "sales",
           title: "director"
         },
@@ -348,6 +347,10 @@ test("upsert where clause", async (t) => {
 });
 
 test("upsert where clause omit onConflictUpdate", async (t) => {
+  await t.context.client.query(
+    `COMMENT ON COLUMN roles.rank IS E'@omit updateOnConflict'`
+  );
+
   const upsertDirector = async ({
     projectName = "sales",
     title = "director",
@@ -361,7 +364,7 @@ test("upsert where clause omit onConflictUpdate", async (t) => {
   }) => {
     const query = nanographql(`
       mutation {
-        upsertRole(ignore: {name: true}, where: {
+        upsertRole(ignore: [NAME], where: {
           projectName: "sales",
           title: "director"
         },
@@ -395,7 +398,7 @@ test("upsert where clause omit onConflictUpdate", async (t) => {
     const res = await fetchAllRoles(t);
     t.is(res.data.allRoles.edges[0].node.projectName, "sales");
     t.is(res.data.allRoles.edges[0].node.title, "director");
-    t.is(res.data.allRoles.edges[0].node.name, "jerry");
+    t.is(res.data.allRoles.edges[0].node.name, "jerry"); // name is unchanged because it is explicitly ignored
     t.is(res.data.allRoles.edges[0].node.rank, 1); // rank is unchanged because it is @omit updateOnConflict
 
     // assert only one record
