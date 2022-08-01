@@ -388,7 +388,7 @@ function createUpsertField({
                 hasWhereClauseValue = true;
               }
 
-              ignoreUpdate[attr.name] = omit(attr, "updateOnConflict") || omit(attr, "update");
+              ignoreUpdate[attr.name] = omit(attr, "updateOnConflict");
               if (onConflict && onConflict.doNothing) {
                 ignoreUpdate[attr.name] = true;
               } else if (onConflict && onConflict.doUpdate && Object.prototype.hasOwnProperty.call(

@@ -128,7 +128,6 @@ mutation {
 
 - Add `@omit upsert` to column comments to prevent them from being insertable or updateable in an upsert mutation.
 - Add `@omit updateOnConflict` to column comments to prevent them from being modified on _existing_ rows in an upsert mutation.
-  - `@omit update` is also honored this way, but also prevents those columns from being modified by normal update mutations, so `@omit updateOnConflict` is the alternative if you still want to be able to update those columns in normal update mutations.
 
 ## Credits
 
