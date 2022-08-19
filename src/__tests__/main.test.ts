@@ -169,6 +169,23 @@ const fetchAllRoles = async (t: PluginExecutionContext) => {
   return execGqlOp(t, query);
 };
 
+const fetchAllCars = async (t: PluginExecutionContext) => {
+  const query = nanographql`
+  query {
+    allCars {
+      edges {
+        node {
+          make
+          model
+          trim
+          active
+        }
+      }
+    }
+  }`;
+  return execGqlOp(t, query);
+};
+
 const create = async (
   t: PluginExecutionContext,
   extraProperties: Record<string, unknown> = {}
@@ -523,5 +540,63 @@ test("upsert where clause on conflict do nothing", async (t) => {
       await upsertDirector({ name: "frank", rank: 2 }),
       "onConflict: {doNothing: true} should yield no upsert effect"
     );
+  }
+});
+
+test("upsert handling of nullable defaulted columns", async (t) => {
+  await t.context.client.query(`
+      create table car(
+        id serial primary key,
+        make text not null,
+        model text not null,
+        trim text not null default 'standard',
+        active boolean,
+        unique (make, model, trim)
+      )
+  `);
+  await initializePostgraphile(t);
+  const upsertCar = async ({
+    trim,
+    active = false,
+  }: {
+    trim?: string;
+    make?: string;
+    model?: string;
+    active?: boolean;
+  } = {}) => {
+    const query = nanographql(`
+      mutation {
+        upsertCar(
+        input: {
+          car: {
+            make: "Honda",
+            model: "Civic",
+            ${trim ? `trim: "${trim}"` : ""}
+            active: ${active}
+          }
+        }) {
+          clientMutationId
+        }
+      }
+    `);
+    return execGqlOp(t, query);
+  };
+  {
+    await upsertCar();
+    await upsertCar({ active: true });
+    let res = await fetchAllCars(t);
+    t.is(res.data.allCars.edges.length, 1);
+    t.like(res.data.allCars.edges[0], {
+      node: {
+        active: true,
+        make: "Honda",
+        model: "Civic",
+        trim: "standard",
+      },
+    });
+
+    await upsertCar({ trim: "non-standard" });
+    res = await fetchAllCars(t);
+    t.is(res.data.allCars.edges.length, 2);
   }
 });
