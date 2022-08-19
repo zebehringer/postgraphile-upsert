@@ -362,13 +362,28 @@ function createUpsertField({
               {}
             );
 
-            const fieldToAttributeMap = attributes.reduce(
-              (acc, attr) => ({
-                ...acc,
-                [inflection.camelCase(attr.name)]: attr,
-              }),
-              {}
-            );
+            const fieldToAttributeMap: { [fieldName: string]: Attribute } = {};
+
+            // where clause should override unknown "input" for the matching column to be a true upsert
+            attributes.forEach((attr) => {
+              const fieldName = inflection.camelCase(attr.name);
+              fieldToAttributeMap[fieldName] = attr;
+              if (where && hasOwnProperty(where, fieldName)) {
+                const whereValue: Primitive | undefined =
+                  where[inflection.camelCase(attr.name)];
+
+                if (
+                  hasOwnProperty(inputData, fieldName) &&
+                  inputData[fieldName] !== whereValue
+                ) {
+                  throw new Error(
+                    `Value passed in the input for ${fieldName} does not match the where clause value.`
+                  );
+                } else {
+                  inputData[fieldName] = whereValue;
+                }
+              }
+            });
 
             // Depending on whether a where clause was passed, we want to determine which
             // constraint to use in the upsert ON CONFLICT cause.
@@ -431,17 +446,6 @@ function createUpsertField({
 
             // Loop thru columns and "SQLify" them
             attributes.forEach((attr) => {
-              // where clause should override unknown "input" for the matching column to be a true upsert
-              let hasWhereClauseValue = false;
-              let whereClauseValue: Primitive | undefined;
-              if (
-                where &&
-                hasOwnProperty(where, inflection.camelCase(attr.name))
-              ) {
-                whereClauseValue = where[inflection.camelCase(attr.name)];
-                hasWhereClauseValue = true;
-              }
-
               if (doUpdateEnabled) {
                 ignoreUpdate[attr.name] = omit(attr, "updateOnConflict");
                 if (onConflict && onConflict.doNothing) {
@@ -473,21 +477,8 @@ function createUpsertField({
               if (hasOwnProperty(inputData, fieldName)) {
                 const val = inputData[fieldName];
 
-                // The user passed a where clause condition value that does not match the upsert input value for the same property
-                if (hasWhereClauseValue && whereClauseValue !== val) {
-                  throw new Error(
-                    `Value passed in the input for ${fieldName} does not match the where clause value.`
-                  );
-                }
-
                 sqlColumns.push(sql.identifier(attr.name));
                 sqlValues.push(gql2pg(val, attr.type, attr.typeModifier));
-              } else if (hasWhereClauseValue) {
-                // If it was ommitted in the input, we should add it
-                sqlColumns.push(sql.identifier(attr.name));
-                sqlValues.push(
-                  gql2pg(whereClauseValue, attr.type, attr.typeModifier)
-                );
               } else if (setTimestamp[attr.name]) {
                 conflictOnlyColumns.push(sql.identifier(attr.name));
               }

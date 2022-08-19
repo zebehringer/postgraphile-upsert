@@ -566,10 +566,7 @@ test("upsert handling of nullable defaulted columns", async (t) => {
   } = {}) => {
     const query = nanographql(`
       mutation {
-        upsertCar(where: {
-          make: "Honda",
-          model: "Civic",
-        },
+        upsertCar(
         input: {
           car: {
             make: "Honda",
