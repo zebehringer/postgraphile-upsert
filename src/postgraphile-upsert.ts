@@ -362,6 +362,14 @@ function createUpsertField({
               {}
             );
 
+            const fieldToAttributeMap = attributes.reduce(
+              (acc, attr) => ({
+                ...acc,
+                [inflection.camelCase(attr.name)]: attr,
+              }),
+              {}
+            );
+
             // Depending on whether a where clause was passed, we want to determine which
             // constraint to use in the upsert ON CONFLICT cause.
             // If where clause: Check for the first constraint that the where clause provides all matching unique columns
@@ -370,21 +378,43 @@ function createUpsertField({
             const primaryKeyConstraint = uniqueConstraints.find(
               (con) => con.type === "p"
             );
+            const primaryKeyConstraintCols = new Set(
+              primaryKeyConstraint
+                ? primaryKeyConstraint.keyAttributes.map(({ name }) => name)
+                : []
+            );
+
             const inputDataKeys = new Set(Object.keys(inputData));
-            const matchingConstraint = where
-              ? Object.entries(columnsByConstraintName).find(([, columns]) =>
-                  [...columns].every(
-                    (col) => inflection.camelCase(col.name) in where
-                  )
+            const inputDataColumns = new Set(
+              [...inputDataKeys].map((key) => fieldToAttributeMap[key].name)
+            );
+            const inputDataColumnsWithDefaults = new Set([
+              ...inputDataColumns,
+              ...attributes
+                .filter(
+                  (a) => a.hasDefault && !primaryKeyConstraintCols.has(a.name)
                 )
-              : Object.entries(columnsByConstraintName).find(([, columns]) =>
-                  [...columns].every((col) =>
-                    inputDataKeys.has(inflection.camelCase(col.name))
+                .map(({ name }) => name),
+            ]);
+
+            const matchingConstraint =
+              (where
+                ? Object.entries(columnsByConstraintName).find(([, columns]) =>
+                    [...columns].every(
+                      (col) => inflection.camelCase(col.name) in where
+                    )
                   )
-                ) ??
-                Object.entries(columnsByConstraintName).find(
-                  ([key]) => key === primaryKeyConstraint?.name
-                );
+                : Object.entries(columnsByConstraintName).find(([, columns]) =>
+                    [...columns].every((col) => inputDataColumns.has(col.name))
+                  )) ??
+              Object.entries(columnsByConstraintName).find(([, columns]) =>
+                [...columns].every((col) =>
+                  inputDataColumnsWithDefaults.has(col.name)
+                )
+              ) ??
+              Object.entries(columnsByConstraintName).find(
+                ([key]) => key === primaryKeyConstraint?.name
+              );
 
             if (!matchingConstraint) {
               throw new Error(
