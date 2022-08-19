@@ -1,0 +1,1 @@
+{"version":3,"file":"postgraphile-upsert.d.ts","sourceRoot":"","sources":["../src/postgraphile-upsert.ts"],"names":[],"mappings":"AAAA,OAAO,EAAkB,MAAM,EAAE,MAAM,gBAAgB,CAAC;AAYxD,oBAAY,6BAA6B,GAAG;IAC1C,0CAA0C,CAAC,EAAE,OAAO,CAAC;CACtD,CAAC;AAEF,eAAO,MAAM,sBAAsB,EAAE,MAuDpC,CAAC"}

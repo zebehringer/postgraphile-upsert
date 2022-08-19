@@ -1,0 +1,1 @@
+{"version":3,"file":"client.js","sourceRoot":"","sources":["../../../src/__tests__/fixture/client.ts"],"names":[],"mappings":";;;AAAA,2BAA0B;AAGnB,KAAK,UAAU,UAAU,CAAC,MAAyB;IACxD,MAAM,MAAM,GAAG,IAAI,SAAI,CAAC;QACtB,IAAI,EAAE,MAAM,CAAC,QAAQ;QACrB,IAAI,EAAE,WAAW;QACjB,GAAG,MAAM;KACV,CAAC,CAAC;IACH,OAAO,MAAM,CAAC;AAChB,CAAC;AAPD,gCAOC"}

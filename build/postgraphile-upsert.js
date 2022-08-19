@@ -1,0 +1,337 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PgMutationUpsertPlugin = void 0;
+const graphql_1 = require("graphql");
+const assert_1 = __importDefault(require("assert"));
+const PgMutationUpsertPlugin = (builder, options) => {
+    const { enableQueryDefinedConflictResolutionTuning: doUpdateEnabled = false, } = options;
+    builder.hook("GraphQLObjectType:fields", (fields, build, context) => {
+        const { extend, pgGetGqlInputTypeByTypeIdAndModifier, pgGetGqlTypeByTypeIdAndModifier, pgIntrospectionResultsByKind, pgOmit: omit, } = build;
+        const { scope: { isRootMutation }, } = context;
+        if (!isRootMutation)
+            return fields;
+        const allUniqueConstraints = pgIntrospectionResultsByKind.constraint.filter((con) => con.type === "u" || con.type === "p");
+        const upsertFieldsByName = pgIntrospectionResultsByKind.class
+            .filter((table) => !!table.namespace &&
+            !!table.primaryKeyConstraint &&
+            !omit(table, "upsert") &&
+            table.isSelectable &&
+            table.isInsertable &&
+            table.isUpdatable)
+            .reduce((fnsByName, table) => {
+            const gqlTable = pgGetGqlTypeByTypeIdAndModifier(table.type.id, null);
+            if (!gqlTable)
+                return fnsByName;
+            const gqlTableInput = pgGetGqlInputTypeByTypeIdAndModifier(table.type.id, null);
+            if (!gqlTableInput)
+                return fnsByName;
+            const { fn, upsertFnName } = createUpsertField({
+                allUniqueConstraints,
+                table,
+                build,
+                context,
+                gqlTable,
+                gqlTableInput,
+                doUpdateEnabled,
+            });
+            fnsByName[upsertFnName] = fn;
+            return fnsByName;
+        }, {});
+        return extend(fields, upsertFieldsByName);
+    });
+};
+exports.PgMutationUpsertPlugin = PgMutationUpsertPlugin;
+const hasOwnProperty = (x, key) => Object.prototype.hasOwnProperty.call(x, key);
+function createUpsertField({ allUniqueConstraints, build, context, gqlTable, gqlTableInput, table, doUpdateEnabled, }) {
+    const { gql2pg, graphql: { GraphQLObjectType, GraphQLInputObjectType, GraphQLNonNull, GraphQLString, GraphQLBoolean, }, inflection, newWithHooks, parseResolveInfo, pgGetGqlInputTypeByTypeIdAndModifier, pgIntrospectionResultsByKind, pgQueryFromResolveData: queryFromResolveData, pgSql: sql, pgViaTemporaryTable: viaTemporaryTable, pgField, pgOmit: omit, } = build;
+    const { fieldWithHooks } = context;
+    const tableTypeName = inflection.tableType(table);
+    const uniqueConstraints = allUniqueConstraints.filter((con) => con.classId === table.id);
+    const attributes = pgIntrospectionResultsByKind.attribute
+        .filter((attr) => attr.classId === table.id)
+        .sort((a, b) => a.num - b.num);
+    /**
+     * The upsert's WhereType needs to be a combination of TableCondition
+     * but with the constraints of a uniqueConstraint
+     * so find the query generator for an allTable query
+     * but filter by the uniqueConstraints above
+     *
+     * See also:
+     * PgRowByUniqueConstraint
+     * PgConnectionArgCondition
+     * PgAllRows
+     */
+    // For each unique constraint we gather all of the fields into an
+    // InputType. Technically, we probably want to have **each**
+    // uniqueConstraint create it's own type and then union these, but
+    // YOLO
+    const gqlInputTypesByFieldName = uniqueConstraints.reduce((acc, constraint) => {
+        const keys = constraint.keyAttributeNums.map((num) => attributes.find((attr) => attr.num === num));
+        if (keys.some((key) => omit(key, "read"))) {
+            return acc;
+        }
+        else if (!keys.every((_) => _)) {
+            throw new Error("Consistency error: could not find an attribute!");
+        }
+        keys.forEach((key) => {
+            const fieldName = inflection.camelCase(key.name);
+            const InputType = pgGetGqlInputTypeByTypeIdAndModifier(key.typeId, key.typeModifier);
+            if (!InputType) {
+                throw new Error(`Could not find input type for key '${key.name}' on type '${tableTypeName}'`);
+            }
+            acc[fieldName] = { type: InputType };
+        });
+        return acc;
+    }, {});
+    // Unique Where conditions
+    const WhereType = newWithHooks(GraphQLInputObjectType, {
+        name: `Upsert${tableTypeName}Where`,
+        description: `Where conditions for the upsert \`${tableTypeName}\` mutation.`,
+        fields: gqlInputTypesByFieldName,
+    }, {
+        isPgCreateInputType: false,
+        pgInflection: table,
+    });
+    let OnConflictType;
+    if (doUpdateEnabled) {
+        const DoUpdateFieldType = newWithHooks(graphql_1.GraphQLEnumType, {
+            name: `Upsert${tableTypeName}DoUpdateField`,
+            description: `Switch to apply to a given field when resolving upsert conflicts`,
+            values: {
+                ignore: {},
+                current_timestamp: {},
+            },
+        }, {
+            isPgCreateInputType: false,
+            pgInflection: table,
+        });
+        const DoUpdateType = newWithHooks(GraphQLInputObjectType, {
+            name: `Upsert${tableTypeName}DoUpdate`,
+            description: `Common values to apply when resolving upsert conflicts`,
+            fields: attributes.reduce((acc, attr) => {
+                acc[inflection.camelCase(attr.name)] = { type: DoUpdateFieldType };
+                return acc;
+            }, {}),
+        }, {
+            isPgCreateInputType: false,
+            pgInflection: table,
+        });
+        OnConflictType = newWithHooks(GraphQLInputObjectType, {
+            name: `Upsert${tableTypeName}OnConflict`,
+            description: `Fields to skip when resolving conflicts upsert \`${tableTypeName}\` mutation.`,
+            fields: {
+                doNothing: { type: GraphQLBoolean },
+                doUpdate: { type: DoUpdateType },
+            },
+        }, {
+            isPgCreateInputType: false,
+            pgInflection: table,
+        });
+    }
+    // Standard input type that 'create' uses
+    const InputType = newWithHooks(GraphQLInputObjectType, {
+        name: `Upsert${tableTypeName}Input`,
+        description: `All input for the upsert \`${tableTypeName}\` mutation.`,
+        fields: {
+            clientMutationId: {
+                description: "An arbitrary string value with no semantic meaning. Will be included in the payload verbatim. May be used to track mutations by the client.",
+                type: GraphQLString,
+            },
+            ...(gqlTableInput
+                ? {
+                    [inflection.tableFieldName(table)]: {
+                        description: `The \`${tableTypeName}\` to be upserted by this mutation.`,
+                        type: new GraphQLNonNull(gqlTableInput),
+                    },
+                }
+                : null),
+        },
+    }, {
+        isPgCreateInputType: false,
+        pgInflection: table,
+    });
+    // Standard payload type that 'create' uses
+    const PayloadType = newWithHooks(GraphQLObjectType, {
+        name: `Upsert${tableTypeName}Payload`,
+        description: `The output of our upsert \`${tableTypeName}\` mutation.`,
+        fields: ({ fieldWithHooks }) => {
+            const tableName = inflection.tableFieldName(table);
+            return {
+                clientMutationId: {
+                    description: "The exact same `clientMutationId` that was provided in the mutation input, unchanged and unused. May be used by a client to track mutations.",
+                    type: GraphQLString,
+                },
+                [tableName]: pgField(build, fieldWithHooks, tableName, {
+                    description: `The \`${tableTypeName}\` that was upserted by this mutation.`,
+                    type: gqlTable,
+                }),
+            };
+        },
+    }, {
+        isMutationPayload: true,
+        isPgCreatePayloadType: false,
+        pgIntrospection: table,
+    });
+    const upsertFnName = `upsert${tableTypeName}`;
+    return {
+        upsertFnName,
+        fn: fieldWithHooks(upsertFnName, (context) => {
+            const { getDataFromParsedResolveInfoFragment } = context;
+            return {
+                description: `Upserts a single \`${tableTypeName}\`.`,
+                type: PayloadType,
+                args: {
+                    where: {
+                        type: WhereType,
+                    },
+                    input: {
+                        type: new GraphQLNonNull(InputType),
+                    },
+                    ...(doUpdateEnabled
+                        ? {
+                            onConflict: {
+                                type: OnConflictType,
+                            },
+                        }
+                        : {}),
+                },
+                async resolve(_data, { where: whereRaw, input, onConflict }, { pgClient }, resolveInfo) {
+                    const where = whereRaw;
+                    const parsedResolveInfoFragment = parseResolveInfo(resolveInfo);
+                    const resolveData = getDataFromParsedResolveInfoFragment(parsedResolveInfoFragment, PayloadType);
+                    const insertedRowAlias = sql.identifier(Symbol());
+                    const query = queryFromResolveData(insertedRowAlias, insertedRowAlias, resolveData, {});
+                    const sqlColumns = [];
+                    const conflictOnlyColumns = [];
+                    const sqlValues = [];
+                    const inputData = input[inflection.tableFieldName(table)];
+                    // Find the unique constraints
+                    const uniqueConstraints = allUniqueConstraints.filter((con) => con.classId === table.id);
+                    // Store attributes (columns) for easy access
+                    const attributes = pgIntrospectionResultsByKind.attribute.filter((attr) => attr.classId === table.id);
+                    // Figure out which columns the unique constraints belong to
+                    const columnsByConstraintName = uniqueConstraints.reduce((acc, constraint) => ({
+                        ...acc,
+                        [constraint.name]: new Set(constraint.keyAttributeNums.map((num) => {
+                            const match = attributes.find((attr) => attr.num === num);
+                            assert_1.default(match, `no attribute found for ${num}`);
+                            return match;
+                        })),
+                    }), {});
+                    const fieldToAttributeMap = {};
+                    // where clause should override unknown "input" for the matching column to be a true upsert
+                    attributes.forEach((attr) => {
+                        const fieldName = inflection.camelCase(attr.name);
+                        fieldToAttributeMap[fieldName] = attr;
+                        if (where && hasOwnProperty(where, fieldName)) {
+                            const whereValue = where[inflection.camelCase(attr.name)];
+                            if (hasOwnProperty(inputData, fieldName) &&
+                                inputData[fieldName] !== whereValue) {
+                                throw new Error(`Value passed in the input for ${fieldName} does not match the where clause value.`);
+                            }
+                            else {
+                                inputData[fieldName] = whereValue;
+                            }
+                        }
+                    });
+                    // Depending on whether a where clause was passed, we want to determine which
+                    // constraint to use in the upsert ON CONFLICT cause.
+                    // If where clause: Check for the first constraint that the where clause provides all matching unique columns
+                    // If no where clause: Check for the first constraint that our upsert columns provides all matching unique columns
+                    //     or default to primary key constraint (existing functionality).
+                    const primaryKeyConstraint = uniqueConstraints.find((con) => con.type === "p");
+                    const primaryKeyConstraintCols = new Set(primaryKeyConstraint
+                        ? primaryKeyConstraint.keyAttributes.map(({ name }) => name)
+                        : []);
+                    const inputDataKeys = new Set(Object.keys(inputData));
+                    const inputDataColumns = new Set([...inputDataKeys].map((key) => fieldToAttributeMap[key].name));
+                    const inputDataColumnsWithDefaults = new Set([
+                        ...inputDataColumns,
+                        ...attributes
+                            .filter((a) => a.hasDefault && !primaryKeyConstraintCols.has(a.name))
+                            .map(({ name }) => name),
+                    ]);
+                    const matchingConstraint = (where
+                        ? Object.entries(columnsByConstraintName).find(([, columns]) => [...columns].every((col) => inflection.camelCase(col.name) in where))
+                        : Object.entries(columnsByConstraintName).find(([, columns]) => [...columns].every((col) => inputDataColumns.has(col.name)))) ??
+                        Object.entries(columnsByConstraintName).find(([, columns]) => [...columns].every((col) => inputDataColumnsWithDefaults.has(col.name))) ??
+                        Object.entries(columnsByConstraintName).find(([key]) => key === primaryKeyConstraint?.name);
+                    if (!matchingConstraint) {
+                        throw new Error(`Unable to determine upsert unique constraint for given upserted columns: ${[
+                            ...inputDataKeys,
+                        ].join(", ")}`);
+                    }
+                    const [constraintName] = matchingConstraint;
+                    const ignoreUpdate = {};
+                    const setTimestamp = {};
+                    // Loop thru columns and "SQLify" them
+                    attributes.forEach((attr) => {
+                        if (doUpdateEnabled) {
+                            ignoreUpdate[attr.name] = omit(attr, "updateOnConflict");
+                            if (onConflict && onConflict.doNothing) {
+                                ignoreUpdate[attr.name] = true;
+                            }
+                            else if (onConflict &&
+                                onConflict.doUpdate &&
+                                Object.prototype.hasOwnProperty.call(onConflict.doUpdate, inflection.camelCase(attr.name))) {
+                                if (onConflict.doUpdate[inflection.camelCase(attr.name)] ==
+                                    "current_timestamp") {
+                                    delete ignoreUpdate[attr.name];
+                                    setTimestamp[attr.name] = true;
+                                }
+                                else {
+                                    ignoreUpdate[attr.name] =
+                                        onConflict.doUpdate[inflection.camelCase(attr.name)] ==
+                                            "ignore";
+                                }
+                            }
+                        }
+                        // Do we have a value for the field in input?
+                        const fieldName = inflection.column(attr);
+                        if (hasOwnProperty(inputData, fieldName)) {
+                            const val = inputData[fieldName];
+                            sqlColumns.push(sql.identifier(attr.name));
+                            sqlValues.push(gql2pg(val, attr.type, attr.typeModifier));
+                        }
+                        else if (setTimestamp[attr.name]) {
+                            conflictOnlyColumns.push(sql.identifier(attr.name));
+                        }
+                    });
+                    // Construct a array in case we need to do an update on conflict
+                    const conflictUpdateArray = conflictOnlyColumns
+                        .concat(sqlColumns)
+                        .filter((col) => ignoreUpdate[col.names[0]] != true)
+                        .map((col) => sql.query `${sql.identifier(col.names[0])} = ${setTimestamp[col.names[0]]
+                        ? sql.fragment `CURRENT_TIMESTAMP`
+                        : sql.fragment `excluded.${sql.identifier(col.names[0])}`}`);
+                    assert_1.default(table.namespace, "expected table namespace");
+                    // SQL query for upsert mutations
+                    // see: http://www.postgresqltutorial.com/postgresql-upsert/
+                    const conflictAction = conflictUpdateArray.length == 0
+                        ? sql.fragment `do nothing`
+                        : sql.fragment `on constraint ${sql.identifier(constraintName)}
+            do update set ${sql.join(conflictUpdateArray, ", ")}`;
+                    const mutationQuery = sql.query `
+                  insert into ${sql.identifier(table.namespace.name, table.name)}
+                  ${sqlColumns.length
+                        ? sql.fragment `(${sql.join(sqlColumns, ", ")})
+                      values (${sql.join(sqlValues, ", ")})
+                      on conflict ${conflictAction}`
+                        : sql.fragment `default values`} returning *`;
+                    const rows = await viaTemporaryTable(pgClient, sql.identifier(table.namespace.name, table.name), mutationQuery, insertedRowAlias, query);
+                    return {
+                        clientMutationId: input.clientMutationId,
+                        data: rows[0],
+                    };
+                },
+            };
+        }, {
+            pgFieldIntrospection: table,
+            isPgCreateMutationField: false,
+        }),
+    };
+}
+//# sourceMappingURL=postgraphile-upsert.js.map
